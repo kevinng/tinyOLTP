@@ -7,51 +7,48 @@
 #define PF_PAGE_SIZE 256	/* size of a page in characters (bytes) */
 
 typedef struct PFhdr_str {
-	int firstfree;	/* first free page in the linked list of free pages */
-	int numpages; 	/* number of pages in the file */
+	int firstfree; /* first free page in the linked list of free pages */
+	int numpages; /* number of pages in the file */
 } PFhdr_str;
 
 typedef struct PFfpage {
-	int nextfree; 				/* (1) free or not 
-									(2) points to the next free page */
-	char pagebuf[PF_PAGE_SIZE];	/* page data */
+	int nextfree; /* (1) free or not (2) points to the next free page */
+	char pagebuf[PF_PAGE_SIZE];
 } PFfpage;
 
 typedef struct PFftab_ele {
-	boolean valid; 		/* set to TRUE when the file is open */
-	ino_t inode; 		/* inode number of the file */
-	char *fname; 		/* file name */
-	int unixfd; 		/* Unix file descriptor */
-	PFhdr_str hdr; 		/* file header */
-	short hdrchanged; 	/* TRUE if file header has changed */
+	boolean valid; /* set to TRUE when the file is open */
+	ino_t inode; /* inode number of the file */
+	char *fname; /* file name */
+	int unixfd; /* Unix file descriptor */
+	PFhdr_str hdr; /* file header */
+	short hdrchanged; /* TRUE if file header has changed */
 } PFftab_ele;
 
 #define PF_MAX_BUFS ? /* Maximum number of pages to allocate in the buffer */
 
 typedef struct PFbpage {
-	PFfpage fpage; 				/* page data from the file */
-	struct PFbpage *nextpage; 	/* next in the linked list of buffer pages */
-	struct PFbpage *prevpage; 	/* previous in the linked list of buffer 
-									pages */
-	boolean dirty; 				/* TRUE if the page is dirty */
-	short count; 				/* pin count associated with the page */
-	int pagenum; 				/* page number of this page */
-	int fd; 					/* PF file descriptor of this page
-									Note: not to be confused with the UNIX file descriptor) */
+	PFfpage fpage; /* page data from the file */
+	struct PFbpage *nextpage; /* next in the linked list of buffer pages */
+	struct PFbpage *prevpage; /* previous in the linked list of buffer pages */
+	boolean dirty; /* TRUE if the page is dirty */
+	short count; /* pin count associated with the page */
+	int pagenum; /* page number of this page */
+	int fd; /* PF file descriptor of this page (note: not to be confused with the UNIX file descriptor) */
 } PFbpage;
 
-static PFbpage *PFfirstbpage = NULL; 	/* ptr to first buffer page, or NULL */
-static PFbpage *PFlastbpage = NULL; 	/* ptr to last buffer page, or NULL */
-static PFbpage *PFfreebpage = NULL; 	/* list of free buffer page */
+static PFbpage *PFfirstbpage = NULL; /* ptr to first buffer page, or NULL */
+static PFbpage *PFlastbpage = NULL; /* ptr to last buffer page, or NULL */
+static PFbpage *PFfreebpage = NULL; /* list of free buffer page */
 
 #define PF_HASH_TBL_SIZE ? /* Size of the hash table */
 
 typedef struct PFhash_entry {
-	struct PFhash_entry *nextentry;	/* next hash table element or NULL */
-	struct PFhash_entry *preventry;	/* prev hash table element or NULL */
-	int fd;							/* file descriptor */
-	int pagenum;					/* page number */
-	struct PFbpage *bpage;			/* ptr to buffer holder this page */
+	struct PFhash_entry *nextentry; /* next hash table element or NULL */
+	struct PFhash_entry *preventry; /* prev hash table element or NULL */
+	int fd; /* file descriptor */
+	int pagenum; /* page number */
+	struct PFbpage *bpage; /* ptr to buffer holder this page */
 } PFhash_entry;
 
 /*
@@ -59,15 +56,7 @@ This function initializes the PF layer. It also initializes the error stream (to
  */
 void pf_init()
 {
-	/*
-	what do i need to do there?:
 
-	initialize data structures
-	
-	
-	set error stream - i can call a method for this.
-	test- has the error stream been set correctly?
-	 */
 }
 
 /*
