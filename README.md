@@ -1,6 +1,6 @@
-tinyrel
-=======
+tinyOLTP
+========
 
-This is a simple but working online transactional processing (OLTP) database illustrating many textbook design principles. The main purpose of this project is to familiarize myself with basic database design principles. This design is largely based on a 500 level university term project assignment sheet I found online. I did not receive the project files (e.g. source, libraries, Makefile, etc) that comes along with the assignment sheet, so everything here is implemented based on my understanding of the assignment sheet. Good thing, the assignment sheet includes detailed description of the data structures and functions used, so most of my work then is to implement the function bodies and test cases. I chose to leave the name of the university out so this repository will not show on a Google search.
+This is a simple but working online transactional processing (OLTP) database illustrating common database design principles such as those described by [Ramakrisnan et al](http://www.amazon.com/gp/product/007123151X/ref=as_li_ss_tl?ie=UTF8&camp=1789&creative=390957&creativeASIN=007123151X&linkCode=as2&tag=artfumarke-20). The interface and structure designs of this implementation is strongly inspired B. Moon (University of Arizona)'s implementation of minirel.
 
-Most of the code is in C (as designed), though the test cases are in C++ (boost) for convenience sake.
+Test cases are implemented using Zed Shaw's variant of minunit ([Jera Design](http://www.jera.com/techinfo/jtns/jtn002.html)). I've made some changes to Zed's version to include features to facilitate cleaning up in the event of a failed test.
