@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include "tinyoltp.h"
 
-#define PFE_PAGENOTFREE			-1		/* Page free */
 #define PFE_OK					0 		/* No error */
 #define PFE_NOMEM 				1		/* No memory can be allocated */
 #define PFE_NOBUF 				2		/* No buffer unit available */
@@ -19,7 +18,8 @@
 #define PFE_FTABFULL			11		/* File table full */
 #define PFE_FD 					12		/* Invalid file descriptor */
 #define PFE_EOF 				13		/* End of file */
-#define PFE_PAGEUNFIXED 		14		/* Page is not pinned */
+#define PFE_PAGEFREE			14		/* Page not free */
+#define PFE_PAGEUNFIXED 		15		/* Page is not pinned */
 
 /* Paged file table. */
 #define PF_FTAB_SIZE 20					/* Maximum number of entries in a PF 

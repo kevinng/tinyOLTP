@@ -273,7 +273,7 @@ int pf_get_next_page(int fd, int *pagenum, char *pagebuf)
 			0) != -1)
 			return PFE_INVALIDPAGE;
 
-		if (*pagenum == PFE_PAGENOTFREE)
+		if (*pagenum == -1)
 			break;
 	}
 
@@ -357,21 +357,11 @@ int pf_get_this_page(int fd, int pagenum, char *pagebuf)
 		pagebuf = bpage->fpage->pagebuf;
 		return PFE_OK;
 	}
-
-	/* Bring the page up to buffer. */
-	/*
-	find a free buffer page.
-
-	if none exists - do a clean up
-	find a buffer page that has been fully unpinned, and write it back to the
-	physical file.
-		- make this into a function - alloc does this as well?
-
-	if no buffer page exists - then return
-
-	if there is one available - use it
-
-	 */
+	
+	/* Get a free buffer page. */
+	bpage = pf_get_free_buffer_page();
+	if (!bpage)
+		return -1; /* No buffer page can be allocated. */
 
 	if (lseek((pf_file_table+fd)->unixfd,
 		pf_pagenum_to_file_pos(pagenum),
@@ -384,7 +374,7 @@ int pf_get_this_page(int fd, int pagenum, char *pagebuf)
 		sizeof(nextfree)) != sizeof(nextfree))
 		return PFE_INVALIDPAGE;
 
-	if (nextfree != PFE_PAGENOTFREE)
+	if (nextfree != -1)
 		return PFE_INVALIDPAGE;
 
 	pagebuf = malloc(PF_PAGE_SIZE);
@@ -394,6 +384,12 @@ int pf_get_this_page(int fd, int pagenum, char *pagebuf)
 		free(pagebuf);
 		return PFE_INVALIDPAGE;
 	}
+
+	/* Initialize new buffer page settings. */
+	bpage->count = 1; /* Pin this page. */
+	bpage->pagenum = pagenum;
+	bpage->fd = fd;
+	bpage->fpage->pagebuf = pagebuf;
 
 	return PFE_OK;
 }
@@ -422,7 +418,6 @@ int pf_alloc_page(int fd, int *pagenum, char *pagebuf)
 		return -1; /* Unable to allocate buffer page. */
 
 	/* Update the list tracking the list of free pages. */
-	
 	/* Check if we are at the end of file. */
 	if (pfft_ele->hdr.firstfree >= pfft_ele->hdr.numpages) {
 		/* If so, the nextfree position is simply the page after this one.
@@ -451,19 +446,17 @@ int pf_alloc_page(int fd, int *pagenum, char *pagebuf)
 	page data. */
 	pagebuf = buffer_page->fpage->pagebuf;
 	
-	/* Set the defaults for this new buffer page. */
-	buffer_page->fpage->nextfree = PFE_PAGENOTFREE; /* Mark as not free. */
-	buffer_page->dirty = TRUE; /* Mark this page dirty. */
+	/* Initialize pagenum and fd. */
 	buffer_page->count = 1; /* Pin this page. */
 	buffer_page->pagenum = *pagenum;
 	buffer_page->fd = fd;
 
-	/* Initialize the new hash table entry for the new buffer page. */
+	/* Initialize new hash table entry for the new buffer page. */
 	PFhash_entry new_he;
 	new_he.fd = fd;
 	new_he.pagenum = *pagenum;
 	new_he.bpage = buffer_page;
-		
+	
 	/* Insert the new hash table entry into the hash table. */
 	unsigned hash_idx = pf_hash(fd, *pagenum);
 	PFhash_entry *old_he = pf_hash_table+hash_idx;
@@ -504,10 +497,11 @@ int pf_dispose_page(int fd, int pagenum)
 	if (hash_entry->bpage->count > 0)
 		return -1;
 
+	/* Free up the memory allocated. */
+	free(hash_entry->bpage->fpage->pagebuf);
+
 	/* Set this page's nextfree value to the header's first free value. */
 	hash_entry->bpage->fpage->nextfree = (pf_file_table+fd)->hdr.firstfree;
-	if (pf_dirty_page(fd, pagenum) != PFE_OK)
-		return -1;
 
 	/* Set the header's firstfree value to this page. */
 	(pf_file_table+fd)->hdr.firstfree = pagenum;
@@ -647,7 +641,6 @@ void pf_set_err_stream(FILE *fp)
 	err_stream = fp;
 }
 
-
 long pf_pagenum_to_file_pos(int pagenum)
 {
 	size_t hdr_size = 2 * sizeof(int);
@@ -729,8 +722,8 @@ PFhash_entry *pf_hash_lookup(int fd, int pagenum)
 	return NULL;
 }
 
-PFbpage *pf_bpage_lookup(int fd, int pagenum) {
-
+PFbpage *pf_bpage_lookup(int fd, int pagenum)
+{
 	/* Index the hash table. */
 	PFhash_entry *pfhe = pf_hash_lookup(fd, pagenum);
 	if (!pfhe)
@@ -803,6 +796,13 @@ PFbpage *pf_get_free_buffer_page()
 			bp_to_free++;
 		}
 	}
+
+	/* Set the buffer page to default values. */
+	buffer_page->dirty = FALSE;
+	buffer_page->count = 0;
+	buffer_page->pagenum = -1;
+	buffer_page->fd = -1;
+	buffer_page->fpage->nextfree = -1;
 
 	return buffer_page;
 }
