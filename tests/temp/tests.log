@@ -1,0 +1,22 @@
+DEBUG tests/pf_tests.c:353: ----- RUNNING: ./tests/pf_tests
+DEBUG tests/pf_tests.c:334: 
+----- test_pf_create_file_should_fail_if_file_exists
+DEBUG tests/pf_tests.c:21: fd: -1
+DEBUG tests/pf_tests.c:44: ret_code: -1
+DEBUG tests/pf_tests.c:51: n_read: 12
+DEBUG tests/pf_tests.c:335: 
+----- test_pf_create_file_should_work_with_valid_input
+DEBUG tests/pf_tests.c:338: 
+----- test_pf_open_file_should_fail_if_file_does_not_exists
+DEBUG tests/pf_tests.c:339: 
+----- test_pf_open_file_should_fail_if_we_open_the_same_file_twice
+DEBUG tests/pf_tests.c:128: pf_create_file() return code: 0
+DEBUG tests/pf_tests.c:129: PFE_OK: 0
+DEBUG src/pf/pf.c:150: fstat_ret_code: 0
+DEBUG tests/pf_tests.c:134: pf_open_file() return code: 1
+DEBUG src/pf/pf.c:150: fstat_ret_code: 0
+DEBUG tests/pf_tests.c:139: pf_open_file() return code: -1
+DEBUG tests/pf_tests.c:342: 
+----- test_write_page
+DEBUG src/pf/pf.c:150: fstat_ret_code: 0
+[ERROR] (tests/pf_tests.c:213: errno: No such file or directory) Should be able to get this page.

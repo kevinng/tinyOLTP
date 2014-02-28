@@ -15,10 +15,12 @@ Unit testing macros from Zed Shaw (c.learncodethehardway.org).
 #define mu_suite_start() char *message = NULL;
 
 #define mu_assert(test, message) if (!(test)) { log_err(message); return message; }
+#define mu_assert_with_clean_up(test, message, clean_up) if(!(test)) { log_err(message); clean_up; return message; }
 #define mu_run_test(test) debug("\n-----%s", " " #test);\
 	message = test(); tests_run++; if (message) return message;
 
 #define RUN_TESTS(name) int main(int argc, char *argv[]) {\
+    argc = 1; /* Just to stop the compiler from warning. */\
 	debug("----- RUNNING: %s", argv[0]);\
 	printf("----\nRUNNING: %s\n", argv[0]);\
 	char *result = name();\

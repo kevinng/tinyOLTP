@@ -1,230 +1,808 @@
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include "../test/dbg.h"
 #include "pf.h"
-#include "tinyrel.h"
+#include "tinyoltp.h"
 
-#define PF_FTAB_SIZE 1024	/* maximum number of entries in a PF file table */
-#define PF_PAGE_SIZE 256	/* size of a page in characters (bytes) */
+/* Output Settings. */
+static FILE *err_stream = NULL; /* Error messages are printed to this file. */
+#define TEMP_ROOT	"temp/"	 	/* Root folder for all temporary outputs. */
 
-typedef struct PFhdr_str {
-	int firstfree; /* first free page in the linked list of free pages */
-	int numpages; /* number of pages in the file */
-} PFhdr_str;
+/* Paged file table. */
+static PFftab_ele *pf_file_table;		/* The PF file table. */
+static unsigned int pf_file_count;	 	/* The number of elements in the 
+										PF file table. */
 
-typedef struct PFfpage {
-	int nextfree; /* (1) free or not (2) points to the next free page */
-	char pagebuf[PF_PAGE_SIZE];
-} PFfpage;
+/* Buffer manager. */
+static PFbpage *PFfirstbpage = NULL; 		/* Ptr to first buffer page,
+											or NULL */
+static PFbpage *PFlastbpage = NULL; 		/* Ptr to last buffer page, 
+											or NULL */
+static PFbpage *PFfreebpage = NULL; 		/* List of free buffer page */
+static PFhash_entry *pf_hash_table = NULL;	/* The hash table to access a 
+											buffer page. */
+static unsigned int pf_hash_count;			/* Number of entries in the 
+											hash table. */
 
-typedef struct PFftab_ele {
-	boolean valid; /* set to TRUE when the file is open */
-	ino_t inode; /* inode number of the file */
-	char *fname; /* file name */
-	int unixfd; /* Unix file descriptor */
-	PFhdr_str hdr; /* file header */
-	short hdrchanged; /* TRUE if file header has changed */
-} PFftab_ele;
+/* Last error message. */
+#define ERR_MSG_MAX_LEN	256
+static char last_err_msg[ERR_MSG_MAX_LEN];
 
-#define PF_MAX_BUFS ? /* Maximum number of pages to allocate in the buffer */
-
-typedef struct PFbpage {
-	PFfpage fpage; /* page data from the file */
-	struct PFbpage *nextpage; /* next in the linked list of buffer pages */
-	struct PFbpage *prevpage; /* previous in the linked list of buffer pages */
-	boolean dirty; /* TRUE if the page is dirty */
-	short count; /* pin count associated with the page */
-	int pagenum; /* page number of this page */
-	int fd; /* PF file descriptor of this page (note: not to be confused with the UNIX file descriptor) */
-} PFbpage;
-
-static PFbpage *PFfirstbpage = NULL; /* ptr to first buffer page, or NULL */
-static PFbpage *PFlastbpage = NULL; /* ptr to last buffer page, or NULL */
-static PFbpage *PFfreebpage = NULL; /* list of free buffer page */
-
-#define PF_HASH_TBL_SIZE ? /* Size of the hash table */
-
-typedef struct PFhash_entry {
-	struct PFhash_entry *nextentry; /* next hash table element or NULL */
-	struct PFhash_entry *preventry; /* prev hash table element or NULL */
-	int fd; /* file descriptor */
-	int pagenum; /* page number */
-	struct PFbpage *bpage; /* ptr to buffer holder this page */
-} PFhash_entry;
-
-/*
-This function initializes the PF layer. It also initializes the error stream (to stderr). This must be the first function to call in order to use the PF layer. No return value.
+/**
+ * Initializes the PF layer. Must be called before using the PF layer.
  */
 void pf_init()
 {
+	free(pf_file_table);
+	free(pf_hash_table);
+	free(PFfreebpage);
 
+	PFfirstbpage = NULL;
+	PFlastbpage = NULL;
+
+	pf_file_count = 0;
+	pf_hash_count = 0;
+
+	pf_file_table = malloc(PF_FTAB_SIZE * sizeof(PFftab_ele));
+
+	/* Allocate memory for the buffer hash table. */
+	pf_hash_table = malloc(PF_HASH_TBL_SIZE * sizeof(PFhash_entry));
+
+	/* Allocate memory for the buffer list - note: for the buffer structures, NOT the page data (the buffer refers to the page data via a pointer to PFfpage structure). */
+	PFfreebpage = malloc(PF_MAX_BUFS * sizeof(PFbpage));
+	/* Create paged file structures for all buffer pages - without allocating
+	memory for the page data. */
+	int i;
+	for (i = 0; i < PF_MAX_BUFS; i++) {
+		PFfpage new_pffp;
+		PFBpage *pfbp = PFfreebpage + i;
+		pfbp = &new_pffp;
+	}
+	
+	/* Set the error stream. */
+	FILE *err_fp;
+	if ((err_fp = fopen(TEMP_ROOT "error.log", "a")) == NULL)
+		exit(1);
+	pf_set_err_stream(err_fp);
+
+	/* Null-terminate the last error message. */
+	last_err_msg[0] = '\0';
 }
 
-/*
-This function creates a file named filename. This file should not have already existed before. The system call open() is used to create the file. The PF file header is initialized (for firstfree and numpages). This PF header information is written to the file by using the write() system call. After the header has been written, the file is closed using the close() system call. This function returns PFE_OK if the operation is successful, an error condition otherwise.
-
-char *filename		- name of the file to be created
-  */
+/**
+ * Creates a new PF layer file.
+ * 
+ * @param  filename name of the file to be created.
+ * @return          PFE_OK if successful, Returns an error code on error.
+ */
 int pf_create_file(char *filename)
 {
+	int fd, perms = 0666;
+
+	/* Tests if file filename exists by opening it. */
+	if (open(filename, O_RDONLY, perms) != -1)
+		return -1;
+
+	/* Create a new file. */
+	if ((fd = creat(filename, perms)) == -1)
+		return -1;
+
+	/* The header - the first free page in the file followed by the number of pages in the file. */
+	if (pf_write_hdr(fd, 0, 0) == PFE_OK)
+		return PFE_OK;
+	else {
+		/* Undo what we did, and delete the (incomplete) file we've 
+		created. */
+		unlink(filename);
+	}
+
 	return -1;
 }
 
-/*
-This function destroys the file filename. The file should exist, and should not be already open. This function returns PFE_OK if the operation is succ
-essful.
-
-char *filename		- name of the file to be destroyed
+/**
+ * Destroy the file filename. If the file is open, it will be closed by 
+ * calling pf_close_file().
+ * 
+ * @param  filename name of the file to be destroyed.
+ * @return          PFE_OK if successful. -1 on error.
  */
 int pf_destroy_file(char *filename)
 {
-	return -1;
+	/* Find the file descriptor of the filename. */
+	int fd = -1;
+	int i;
+	for (i = 0; i < (int)pf_file_count; i++) {
+		if (strcmp((pf_file_table+i)->fname, filename) == 0) {
+			fd = i;
+			break;
+		}
+	}
+
+	if (fd != -1) {
+		if (pf_close_file(fd) != PFE_OK)
+			return -1;
+	}
+
+	if (unlink(filename) != -1)
+		return -1;
+
+	return PFE_OK;
 }
 
-/*
-This function opens the file named filename using the system call open(). The file header is read and the inode of the file is obtained by using the system call fstat(). The fields in the file table entry are filled accordingly and the index of the file table entry is returned. (This is the PF file descriptor.) It is possible to open a file more than once, however, it will be treated as 2 separate files (different file descriptors, different buffers). Thus, opening a file more than once for writing may corrupt the file, and can, in certain circumstances, crash the PF layer. Note that even if only one instance of a file is for writing, problems may occur because some writes may not be seen by a reader of another instance of the file. This function returns a PF file descriptor if the operation is successful, an error condition if otherwise.
-
-char *filename		- name of the file to be opened
+/**
+ * Open PF layer file.
+ * 
+ * @param  filename name of the file to be opened.
+ * @return          PF file descriptor of the newly opened file. -1 if an 
+ * error occured.
  */
 int pf_open_file(char *filename)
 {
-	return -1;
+	/* Make sure the PF file table is not full. */
+	if (pf_file_count >= PF_FTAB_SIZE)
+		return -1;
+	
+	/* Open file. */
+	int perms = 0666;
+	int fd = open(filename, O_RDWR, perms);
+	if (fd == -1)
+		return -1;
+
+	/* Obtain the inode of the file. */
+	struct stat stbuf;
+	int fstat_ret_code = fstat(fd, &stbuf);
+	debug("fstat_ret_code: %d", fstat_ret_code);
+	if (fstat_ret_code == -1)
+		return -1;
+
+	/* Make sure this file has not been opened before. */
+	int pff_cnt = pf_file_count;
+	PFftab_ele *pf_file_ele;
+	while (pff_cnt-- > 0) {
+		pf_file_ele = pf_file_table+pff_cnt;
+		/* Find a PFftab_ele with the same name and inode number as the one
+		just opened. */
+		if (pf_file_ele->inode == stbuf.st_ino && 
+			strcmp(pf_file_ele->fname, filename) == 0)
+			return -1;
+	}
+
+	/* Initialize new PFftab_ele. */
+	struct PFftab_ele ftab_ele;
+	ftab_ele.valid = TRUE;
+	ftab_ele.inode = stbuf.st_ino;
+	ftab_ele.fname = malloc(strlen(filename)+1);
+	strcpy(ftab_ele.fname, filename);
+	ftab_ele.unixfd = fd;
+	read(fd, &(ftab_ele.hdr.firstfree), sizeof(ftab_ele.hdr.firstfree));
+	read(fd, &(ftab_ele.hdr.numpages), sizeof(ftab_ele.hdr.numpages));
+	ftab_ele.hdrchanged = FALSE;
+
+	/* Assign ftab_ele to the file table. */
+	/* Note: memory has already been allocated at initialization. */
+	*(pf_file_table+pf_file_count) = ftab_ele;
+	pf_file_count++;
+
+	return pf_file_count;
 }
 
-/*
-This function closes the file associated with the PF file descriptor fd. The buffers of the file are flushed (meaning the dirty pages are written back). If the file header has changed, it is written back to the file. The file is finally closed by using the system call close(). The file table entry corresponding to that file is made invalid. This function returns PFE_OK if the operation is successful, an error condition otherwise.
-
-int fd 				- PF file descriptor
+/**
+ * Closes the file associated with the PF file descriptor fd. The buffers of 
+ * the file are flushed (meaning the dirty pages are written back). If the 
+ * file header has changed, it is written back to the file. The file is 
+ * finally closed by using the system call close(). The file table entry 
+ * corresponding to that file is made invalid.
+ * 
+ * @param  fd paged file descriptor of the file to close.
+ * @return    PFE_OK if successful, -1 otherwise.
  */
 int pf_close_file(int fd)
 {
-	return -1;
+	/* Write dirty pages back to file (if dirty). */
+
+	/* Iterate the double linked list. */
+	PFbpage *this_bpage = PFfirstbpage;
+	while (this_bpage != PFlastbpage) {
+		if (this_bpage->fd == fd &&
+			this_bpage->dirty == TRUE) {
+
+			if (this_bpage->count > 0)
+				return -1; /* Page is pinned. 
+					Flushing it might cause inconsistency. */
+
+			/* Write page. */
+			pf_write_page(fd,
+				this_bpage->fpage->nextfree,
+				this_bpage->pagenum,
+				this_bpage->fpage->pagebuf);
+		}
+
+		this_bpage++;
+	}
+
+	/* Index the paged file table element. */
+	PFftab_ele *pfft_ele = pf_file_table + fd;
+
+	/* Write file header back to file (if dirty). */
+	if (pfft_ele->hdrchanged)
+		pf_write_hdr(fd, pfft_ele->hdr.firstfree, pfft_ele->hdr.numpages);
+
+	/* Close Unix file. */
+	close(pfft_ele->unixfd);
+
+	/* Move all entries backwards. */
+	PFftab_ele *last_ele = pf_file_table + pf_file_count;
+	PFftab_ele *next_ele;
+	while (pfft_ele != last_ele) {
+		next_ele = pfft_ele + 1;
+		pfft_ele = next_ele;
+		pfft_ele++;
+	}
+	
+	return PFE_OK;
 }
 
-/*
-This function gets the first valid page (page being used, either empty or not) after the page represented by pagenum in the file represented by fd. A linear scan of the file is done and each page is retrieved. If a page is retrieved is not valid, then it is unpinned and the next page is read. The pagenum argument is used to return the page number of the next valid page. The pagebug arguments points to the content of the PF data page. This function returns PFE_OK if the operation is successful, PFE_EOF if the end of file is reached without finding any used page data, PFE_INVALIDPAGE if page is invalid, a PF error code otherwise.
-
-int fd 				- PF file descriptor
-int *pagenum		- input starting page number, returns page number of the 
-	first page after the starting page number
-char **pagebuf		- return data of the page
+/**
+ * Gets the first valid page after page pagenum in file fd.
+ * 
+ * @param  fd      PF file descriptor.
+ * @param  pagenum set to the starting page number. Returns page number of the
+ *                 first page after the starting page number.
+ * @param  pagebuf return data of the page.
+ * @return         PFE_OK if successful. FE_EOF if the end of file is reached
+ *                        without finding any used page data, PFE_INVALIDPAGE
+ *                        if page is invalid, a PF error code otherwise.
  */
-int pf_get_next_page(int fd, int *pagenum, char **pagebuf)
+int pf_get_next_page(int fd, int *pagenum, char *pagebuf)
 {
-	return -1;
+	/* WRONG - I NEED TO GET IT UP INTO MEMORY FIRST! */
+
+	*pagenum = -1;
+	int i;
+	for (i = 1; /* Start from the page after pagenum. */
+		read((pf_file_table+fd)->unixfd, 
+			&pagenum, 
+			sizeof(int)) == sizeof(int);
+		i++) {
+		if (lseek((pf_file_table+fd)->unixfd, 
+			pf_pagenum_to_file_pos(*pagenum + i), 
+			0) != -1)
+			return PFE_INVALIDPAGE;
+
+		if (*pagenum == PFE_PAGENOTFREE)
+			break;
+	}
+
+	if (*pagenum == -1)
+		return PFE_INVALIDPAGE;
+
+	/* Continue fetching this page. */
+	pagebuf = malloc(PF_PAGE_SIZE);
+	if (read((pf_file_table+fd)->unixfd, 
+		pagebuf, PF_PAGE_SIZE) != PF_PAGE_SIZE) {
+		free(pagebuf);
+		return PFE_INVALIDPAGE;
+	}
+
+	return PFE_OK;
+	
+	/*
+	
+	how do i want to test this?
+
+
+	create a empty file
+	try access with -1, it should return the first page.
+
+	create a file with 3 entries, both with data.
+	try accessing with pagenum1, it should return pagenum 2
+
+	create a file with 3 entries, 2nd with no data
+	try access with page num 1, it should return pagenum 3
+
+	create a file with 3 entries, 2nd free
+	try accessing with pagenum 2, it should return 3
+
+	create a file with 3 entries, all with data,
+	try accessing with pagenum 1, it should return 2
+
+	create a file with 3 entries, all with data,
+	try accessing with pagenum 2, it should return 3
+
+	create a file with 3 entries, 3 with no data
+	try acessing with 2, it should return EOF
+
+	create a file with 3 entries, all with data
+	try accessing with 4, it should return invalid pagenum
+
+	create a file with 3 entries, all with data
+	try accessing with -2, it should return invalid pagenum
+	 */
 }
 
-/*
-This function gets the first valid page in the file associated with file descriptor fd. This function is implemented using pf_get_next_page(). (A pagenum of -1 is passed to pf_get_next_page() to indicate to start looking for a valid page from the beginning of the file). It returns PFE_OK if the operation is successful, PFE_EOF if the end of file is reached without finding any used page data, a PF error code otherwise.
-
-int fd 				- PF file descriptor
-int *pagenum		- return page number of the first page
-char **pagebuf		- return data of the page
+/**
+ * Returns first valid page in the file associated with file descriptor fd.
+ * 
+ * @param  fd      PF file descriptor.
+ * @param  pagenum return page number of the first page.
+ * @param  pagebuf return data of the page.
+ * @return         PFE_OK if successful. Returns the error codes 
+ * as pf_get_next_page() otherwise.
  */
-int pf_get_first_page(int fd, int *pagenum, char **pagebuf)
+int pf_get_first_page(int fd, int *pagenum, char *pagebuf)
 {
-	return -1;
+	return pf_get_next_page(fd, pagenum, pagebuf);
 }
 
-/*
-This function reads a valid page specified by pagenum from the file associated with file descriptor fd, and sets *pagebuf to point to the page data. If the page specified by pagenum is not valid, then the retrieved page is unpinned, and an error code PFE_INVALIDPAGE is returned. It returns PFE_OK if the page is valid and the operation is successful, and a PF error code otherwise.
-
-int fd 				- PF file descriptor
-int pagenum 		- page number of the page to retrieve
-char **pagebuf		- return data of the page
+/**
+ * Reads a valid page pagenum from the file fd, and sets *pagebuf to point
+ * to the page data. The page is then pinned in memory. An invalid page is
+ * not pinned in memory.
+ * 
+ * @param  fd      PF file descriptor.
+ * @param  pagenum page number of the page to retrieve.
+ * @param  pagebuf return data of the page.
+ * @return         PFE_OK if successful. -1 otherwise.
  */
-int pf_get_this_page(int fd, int pagenum, char **pagebuf)
+int pf_get_this_page(int fd, int pagenum, char *pagebuf)
 {
-	return -1;
+	/* Check if the page exists in memory. */
+	PFbpage *bpage = pf_bpage_lookup(fd, pagenum);
+	if (bpage) {
+		/* Access from buffer. */
+		pagebuf = bpage->fpage->pagebuf;
+		return PFE_OK;
+	}
+
+	/* Bring the page up to buffer. */
+	/*
+	find a free buffer page.
+
+	if none exists - do a clean up
+	find a buffer page that has been fully unpinned, and write it back to the
+	physical file.
+		- make this into a function - alloc does this as well?
+
+	if no buffer page exists - then return
+
+	if there is one available - use it
+
+	 */
+
+	if (lseek((pf_file_table+fd)->unixfd,
+		pf_pagenum_to_file_pos(pagenum),
+		0) == -1)
+		return -1;
+
+	int nextfree;
+	if (read((pf_file_table+fd)->unixfd,
+		&nextfree,
+		sizeof(nextfree)) != sizeof(nextfree))
+		return PFE_INVALIDPAGE;
+
+	if (nextfree != PFE_PAGENOTFREE)
+		return PFE_INVALIDPAGE;
+
+	pagebuf = malloc(PF_PAGE_SIZE);
+	if (read(pf(pf_file_table+fd)->unixfd,
+		pagebuf,
+		PF_PAGE_SIZE) != PF_PAGE_SIZE) {
+		free(pagebuf);
+		return PFE_INVALIDPAGE;
+	}
+
+	return PFE_OK;
 }
 
-/*
-This function allocates a page in the file associated with a file descriptor fd. If there is a free page in the file, the free page is reused without adding a new page to the file. The content of the free page is read into the a buffer page. Note that only valid information from this free page is the nextfree field. Henceforth, this page is considered valid, until it is disposed again. If there is no free page in the file, then a new valid page is added to the file. In both cases, the value of pagenum for the page being allocated by this function must be determined (from the information stored in the file head). In both cases, the page allocated by this function is pinned and marked dirty so that it will be written to the file eventually. This function returns PFE_OK if the operation is successful, an error condition otherwise.
-
-int fd 				- PF file descriptor
-int *pagenum 		- return page number of the page allocated
-char **pagebuf		- return data of the page
+/**
+ * Allocates a page in file fd. If there is a free page in the file, the free
+ * page is reused without adding a new page to the file. Otherwise, a new valid
+ * page is added to the file.
+ * 
+ * @param  fd      [description]
+ * @param  pagenum return page number of the page allocated.
+ * @param  pagebuf return data of the page.
+ * @return         PFE_OK if successful. -1 otherwise.
  */
-int pf_alloc_page(int fd, int *pagenum, char **pagebuf)
+int pf_alloc_page(int fd, int *pagenum, char *pagebuf)
 {
-	return -1;
+	/* Index the paged file table element. */
+	PFftab_ele *pfft_ele = pf_file_table + fd;
+
+	/* The page number is this free page we are giving out. */
+	*pagenum = pfft_ele->hdr.firstfree;
+	
+	/* Get a free buffer page. */ 
+	PFbpage *buffer_page = pf_get_free_buffer_page();
+	if (!buffer_page)
+		return -1; /* Unable to allocate buffer page. */
+
+	/* Update the list tracking the list of free pages. */
+	
+	/* Check if we are at the end of file. */
+	if (pfft_ele->hdr.firstfree >= pfft_ele->hdr.numpages) {
+		/* If so, the nextfree position is simply the page after this one.
+		Simply increment the header's firstfree value. */
+		pfft_ele->hdr.firstfree += 1;
+		buffer_page->fpage->nextfree = pfft_ele->hdr.firstfree;
+	} else {
+		/* Move to the start of the page pagenum. */
+		if (lseek(pfft_ele->unixfd, pf_pagenum_to_file_pos(*pagenum), 0)
+			== -1)
+			return -1;
+		/* Set the firstfree value in the header with the nextfree value in
+		this free page's header. */
+		int nextfree;
+		if (read(pfft_ele->unixfd, &nextfree, sizeof(nextfree)) 
+			!= sizeof(nextfree))
+			return -1; /* Quit to prevent corrupting the file header. */
+
+		pfft_ele->hdr.firstfree = nextfree;
+	}
+
+	/* Allocate memory for the paged file. */
+	buffer_page->fpage = malloc(PF_PAGE_SIZE);
+
+	/* Point pagebuf to the newly initialized paged file structures' 
+	page data. */
+	pagebuf = buffer_page->fpage->pagebuf;
+	
+	/* Set the defaults for this new buffer page. */
+	buffer_page->fpage->nextfree = PFE_PAGENOTFREE; /* Mark as not free. */
+	buffer_page->dirty = TRUE; /* Mark this page dirty. */
+	buffer_page->count = 1; /* Pin this page. */
+	buffer_page->pagenum = *pagenum;
+	buffer_page->fd = fd;
+
+	/* Initialize the new hash table entry for the new buffer page. */
+	PFhash_entry new_he;
+	new_he.fd = fd;
+	new_he.pagenum = *pagenum;
+	new_he.bpage = buffer_page;
+		
+	/* Insert the new hash table entry into the hash table. */
+	unsigned hash_idx = pf_hash(fd, *pagenum);
+	PFhash_entry *old_he = pf_hash_table+hash_idx;
+
+	if (!old_he) {
+		old_he->preventry = &new_he;
+		new_he.preventry = NULL; /* The new hash entry is now the first 								entry in the bucket. */
+	}
+
+	old_he = &new_he; 	/* Let the new hash entry take the index position 
+						in the hash table for this bucket. */
+
+	return PFE_OK;
 }
 
-/*
-This function disposes the page pagenum of the file with file descriptor fd, converting a valid page into a free page. The approach to dispose a page is to bring the page to the buffer (if it is not already there) and change its nextfree field to point to the beginning of the list of free pages associated with the file. Note that the page is brought into memory, only because the nextfree field is kept in a disk page. The first element of the list of free pages associated with the file will be the most recently disposed page. The page is marked dirty in the buffer so that change is sent eventually to the file in the disk. Only a page whose copy in the buffer is unpinned can be disposed. This function returns PFE_OK if the operation is successful, an error condition otherwise.
-
-int fd 				- PF file descriptor
-int pagenum 		- page number of the page to be disposed
+/**
+ * Disposes (i.e. free) page pagenum in file fd.
+ * 
+ * @param  fd      PF file descriptor fd.
+ * @param  pagenum page number of the page to dispose.
+ * @return         PFE_OK if successful. -1 otherwise.
  */
 int pf_dispose_page(int fd, int pagenum)
 {
-	return -1;
+	/* Lookup the hash entry in the table. */
+	PFhash_entry *hash_entry = pf_hash_lookup(fd, pagenum);
+	if (!hash_entry) {
+		/* Page is not in memory - bring it into memory. */
+		char *pagebuf = NULL;
+		if (pf_get_this_page(fd, pagenum, pagebuf) == -1)
+			return -1;
+
+		/* Lookup the hash entry again. */
+		hash_entry = pf_hash_lookup(fd, pagenum);
+	}
+
+	/* Check if the page has been fully unpinned. */
+	if (hash_entry->bpage->count > 0)
+		return -1;
+
+	/* Set this page's nextfree value to the header's first free value. */
+	hash_entry->bpage->fpage->nextfree = (pf_file_table+fd)->hdr.firstfree;
+	if (pf_dirty_page(fd, pagenum) != PFE_OK)
+		return -1;
+
+	/* Set the header's firstfree value to this page. */
+	(pf_file_table+fd)->hdr.firstfree = pagenum;
+	(pf_file_table+fd)->hdrchanged = TRUE; /* Mark the 
+										file header as dirty. */
+
+	return PFE_OK;
 }
 
-/*
-This function marks the pagenum of the file referenced by fd dirty. It returns PFE_OK if the operation is successful, an error condition otherwise.
-
-int fd 				- PF file descriptor
-int pagenum			- page number of the page to be marked dirty
+/**
+ * Marks the pagenum of the file referenced by fd dirty.
+ * 
+ * @param  fd      PF file descriptor
+ * @param  pagenum page number of the page to be marked dirty
+ * @return         PFE_OK if successful. -1 otherwise.
  */
 int pf_dirty_page(int fd, int pagenum)
 {
-	return -1;
+	/* Lookup the hash entry in the table. */
+	PFhash_entry *hash_entry = pf_hash_lookup(fd, pagenum);
+	if (!hash_entry)
+		return -1; /* Invalid fd and pagenum. */
+	
+	hash_entry->bpage->dirty = TRUE;
+	
+	return PFE_OK;
 }
 
-/*
-After checking the validity of the fd and pagenum values, this function unpins the file numbered pagenum of the file with the file descriptor fd. This function returns PFE_OK if the operation is successful, an error condition otherwise.
-
-int fd 				- PF file descriptor
-int pagenum			- page number of the page to be unpinned
+/**
+ * After checking the validity of the fd and pagenum values, this function
+ * unpins the file numbered pagenum of the file with the file descriptor fd.
+ * 
+ * @param  fd      PF file descriptor.
+ * @param  pagenum page number of the page to be unpinned.
+ * @return         PFE_OK if successful. -1 otherwise.
  */
 int pf_unfix_page(int fd, int pagenum)
 {
-	return -1;
+	/* Lookup the hash entry in the table. */
+	PFhash_entry *hash_entry = pf_hash_lookup(fd, pagenum);
+	if (!hash_entry)
+		return -1; /* Invalid fd and pagenum. */
+
+	hash_entry->bpage->dirty = TRUE; /* Mark as dirty. */
+	
+	if (hash_entry->bpage->count > 0)
+		hash_entry->bpage->count--; /* Unpin the page. */ 
+	
+	return PFE_OK;
 }
 
-/*
-If the dirty parameter if TRUE, then it first marks the page dirty before it is unpinned. Otherwise, the effect of this function is identical to that of pf_unfix_page().
-
-int fd				- PF file descriptor
-int pagenum			- page number of the page to be unpinned
-int dirty 			- dirty indication
+/**
+ * If the dirty parameter if TRUE, then it first marks the page dirty before
+ * it is unpinned. Otherwise, the effect of this function is identical to 
+ * that of pf_unfix_page().
+ * 
+ * @param  fd      PF file descriptor.
+ * @param  pagenum page number of the page to be unpinned.
+ * @param  dirty   dirty indication.
+ * @return         PFE_OK if successful. -1 otherwise.
  */
 int pf_unpin_page(int fd, int pagenum, int dirty)
 {
-	return -1;
+	/* Lookup the hash entry in the table. */
+	PFhash_entry *hash_entry = pf_hash_lookup(fd, pagenum);
+	if (!hash_entry)
+		return -1; /* Invalid fd and pagenum. */
+
+	if (dirty)
+		hash_entry->bpage->dirty = TRUE; /* Mark as dirty. */
+
+	if (hash_entry->bpage->count > 0)
+		hash_entry->bpage->count--; /* Unpin the page. */
+
+	return PFE_OK;
 }
 
-/*
-This function changes the name of oldfile to newfile in both the PF file table and the Unix file system. Obviously, if the oldfile does not exist or the newfile does exist, an error should be returned. This function returns PFE_OK if the operation is successful, an error condition otherwise.
-
-char *oldfile		- an old file name.
-char *newfile		- a new file name.
+/**
+ * Renames paged file old_file to new_file.
+ * 
+ * @param  old_file the old filename.
+ * @param  new_file the new filename.
+ * @return         	PFE_OK if successful. -1 otherwise.
  */
-int pf_rename_file(char *oldfile, char *newfile)
+int pf_rename_file(char *old_file, char *new_file)
 {
-	return -1;
+	/* Check if both files exists. */
+	int perms = 0666;
+	if (open(old_file, O_RDONLY, perms) == -1 ||
+		open(new_file, O_RDONLY, perms) == -1)
+		return -1;
+	
+	/* Find the PF table element with the filename. */
+	unsigned i;
+	int fd = -1;
+	PFftab_ele *pfftab_ele;
+	for (i = 0; i < pf_file_count; i++) {
+		pfftab_ele = pf_file_table + i;
+		if (strcmp(pfftab_ele->fname, old_file) == 0) {
+			fd = i;
+			break;
+		}
+	}
+
+	if (fd == -1)
+		return -1; /* Can't find the old file in the paged file table. */
+	
+	/* Close the old file. */
+	if (pf_close_file(fd) != PFE_OK)
+		return -1;
+
+	/* Rename the file. */
+	if (rename(old_file, new_file) != 0)
+		return -1;
+
+	return PFE_OK;
 }
 
-/*
-This function writes the string s onto a stream set by pf_set_err_stream() and then write the last error message from the PF onto the stream. No return value.
-
-char *s 			- a string to be printed along with an error message.
+/**
+ * Write string s onto the stream set by pf_set_err_stream(), and write the
+ * last error message from the PF onto the stream.
+ * 
+ * @param s string to be printed along with an error message.
  */
 void pf_print_error(char *s)
 {
-
+	fprintf(err_stream, "%s: %s", s, last_err_msg);
 }
 
-/*
-This function sets the stream used by pf_print_error to fd. No return value.
-
-FILE *fp 			- file pointer.
+/**
+ * Sets error stream used by pf_print_error() to fp.
+ * 
+ * @param fp error stream to be used by pf_print_error();
  */
 void pf_set_err_stream(FILE *fp)
 {
-
+	err_stream = fp;
 }
 
 
+long pf_pagenum_to_file_pos(int pagenum)
+{
+	size_t hdr_size = 2 * sizeof(int);
+	size_t page_size = (2*sizeof(int)) + PF_PAGE_SIZE; 
+		/* Page header + page size */
+	return hdr_size + page_size * pagenum;
+}
 
+int pf_write_hdr(int fd, int firstfree, int numpages)
+{
+	/* File header data to be written. */
+	int hdr[] = {firstfree, numpages}; 
+	
+	/* Seek to the beginning to the file. */
+	if (lseek(fd, 0L, 0) == -1)
+		return -1;
+	int n_wrote = write(fd, hdr, sizeof(hdr));
 
+	/* Make sure we've wrote the right number of bytes to the file. */
+	if (n_wrote != sizeof(hdr))
+		return -1;
+	
+	/* Close the file. */
+	close(fd);
+	
+	return PFE_OK;
+}
+
+int pf_write_page(int fd, int nextfree, int pagenum, char *pagebuf)
+{
+	/* Index the page file table, and get the Unix file descriptor of the
+	paged file. */
+	int unix_fd = (pf_file_table+fd)->unixfd;
+
+	/* Physical file position of the page we want to overwrite. */
+	int file_pos = pf_pagenum_to_file_pos(pagenum);
+
+	/* Seek the page position in the file. */
+	if (lseek(unix_fd, file_pos, 0) == -1)
+		return -1;
+	/* Note: it is legal to write beyond the end of the file. The gap will be filled in with zeros. */
+
+	/* Write page header. */
+	int page_hdr[2] = {nextfree, pagenum};
+	if (write(unix_fd, page_hdr, sizeof(page_hdr)) == sizeof(page_hdr))
+		return PFE_OK;
+
+	/* Write page data. */
+	if (write(unix_fd, pagebuf, PF_PAGE_SIZE) == PF_PAGE_SIZE)
+		return PFE_OK;
+
+	return -1;
+}
+
+unsigned pf_hash(int fd, int pagenum)
+{
+	unsigned hashval;
+	char hash_str[3] = {fd, pagenum, '\0'};
+
+	int i;
+	for (hashval = 0, i = 0; hash_str[i] != '\0'; i++)
+		hashval = *hash_str + 31 * hashval;
+
+	return hashval % PF_HASH_TBL_SIZE;
+}
+
+PFhash_entry *pf_hash_lookup(int fd, int pagenum)
+{
+	/* Index the hash entry for fd/pagenum to access the hash bucket. */
+	PFhash_entry *hash_entry = pf_hash_table + pf_hash(fd, pagenum);
+
+	/* Look for the hash entry in bucket with the matching fd and pagenum. */
+	while (hash_entry != NULL) {
+		if (hash_entry->fd == fd && hash_entry->pagenum == pagenum)
+			return hash_entry; /* Page found. */
+		hash_entry = hash_entry->nextentry;
+	}
+
+	return NULL;
+}
+
+PFbpage *pf_bpage_lookup(int fd, int pagenum) {
+
+	/* Index the hash table. */
+	PFhash_entry *pfhe = pf_hash_lookup(fd, pagenum);
+	if (!pfhe)
+		return NULL;
+
+	/* Scan the bucket for the right buffer entry. */
+	this_pfhe = pfhe;
+	while (this_pfhe != NULL) {
+		if (this_pfhe->bpage.fd == fd &&
+			this_pfhe->bpage.pagenum == pagenum)
+			return this_pfhe->bpage;
+		this_pfhe = pfhe->nextentry;
+	}
+
+	return NULL;
+}
+
+int pf_get_fd_of_filename(char *filename)
+{
+	unsigned i;
+	for (i = 0; i < pf_file_count; i++) {
+		PFftab_ele *pfft_ele = (pf_file_table + i);
+		if (strcmp(pfft_ele->fname, filename) == 0)
+			return i;
+	}
+
+	return -1;
+}
+
+PFbpage *pf_get_free_buffer_page()
+{
+	PFbpage = buffer_page;
+
+	/* Check the free list of buffer pages. */
+	if (!PFfreebpage) {
+		/* Use one of the free buffer page available. */
+		buffer_page = PFfreebpage++;
+
+		/* Allocate the new page and put it at the beginning of double linked list to support the LRU page replacement strategy. */
+		buffer_page->nextpage = PFfirstbpage;
+		buffer_page->prevpage = NULL;
+		PFfirstbpage = buffer_page;
+	}
+	else {
+		/* All the buffer pages has been allocated during init.
+
+		If there is no buffer page in the free list, then we have already hit reached the maximum number of allowable buffer page, and we must perform page replacement (according to the LRU policy). */
+
+		/* Go backwards on the list of buffer pages, and find one that's not pinned. If it is dirty, write it back onto the disk. Then free the page and give it to here. */
+		PFbpage *bp_to_free = PFlastbpage;	
+		while (bp_to_free != PFfirstbpage) {
+			if (!bp_to_free)
+				return -1;
+			
+			if (bp_to_free->count == 0) {
+				if (bp_to_free->dirty) {
+					/* Write the page back to the disk. */
+					if (pf_write_page(bp_to_free->fd,
+						bp_to_free->fpage->nextfree,
+						bp_to_free->pagenum,
+						bp_to_free->fpage->pagebuf) != PFE_OK)
+						return -1;
+				}
+
+				buffer_page = bp_to_free;
+				/* Note: the buffer page can stay at its current position in the double linked list. There is no need to update its position. */
+				break;
+			}
+
+			bp_to_free++;
+		}
+	}
+
+	return buffer_page;
+}
